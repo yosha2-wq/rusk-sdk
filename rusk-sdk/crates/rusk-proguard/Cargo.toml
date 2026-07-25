@@ -1,0 +1,12 @@
+[package]
+name = "rusk-proguard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+walkdir = { workspace = true }
+rusk-manifest = { workspace = true }
+rusk-jnigen = { workspace = true }
+rusk-ui = { workspace = true }

@@ -1,0 +1,10 @@
+[package]
+name = "rusk-androidgen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusk-manifest = { workspace = true }
+quick-xml = { workspace = true }
+anyhow = { workspace = true }

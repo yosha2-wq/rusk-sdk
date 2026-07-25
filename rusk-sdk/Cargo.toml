@@ -1,0 +1,85 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusk-cli",
+    "crates/rusk-manifest",
+    "crates/rusk-ndk",
+    "crates/rusk-ndk-sys",
+    "crates/rusk-sdkmgr",
+    "crates/rusk-androidgen",
+    "crates/rusk-jnigen",
+    "crates/rusk-javadeps",
+    "crates/rusk-apk",
+    "crates/rusk-ui",
+    "crates/rusk-build",
+    "crates/rusk-keystore",
+    "crates/rusk-proguard",
+    "crates/rusk-bundle",
+    "crates/rusk-lint",
+    "crates/rusk-symbolize",
+    "crates/rusk-profile",
+    "crates/rusk-workspace",
+    "crates/rusk-cache",
+    "crates/rusk-render",
+    "crates/rusk-diagnostics",
+    "crates/rusk-jni-safe",
+    "crates/rusk-embed-jvm",
+    "crates/rusk-tls",
+    "crates/rusk-sqlite",
+    "crates/rusk-incremental",
+]
+
+[workspace.package]
+version = "0.9.7"
+edition = "2021"
+license = "MIT"
+license-file = "LICENSE"
+authors = ["Rusk SDK Contributors"]
+repository = "https://github.com/rusk-sdk/rusk"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+thiserror = "1"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls", "stream"] }
+sha2 = "0.10"
+zip = "0.6"
+walkdir = "2"
+clap = { version = "4", features = ["derive"] }
+quick-xml = { version = "0.31", features = ["serialize"] }
+dirs = "5"
+which = "6"
+xz2 = "0.1"
+
+rusk-manifest = { path = "crates/rusk-manifest" }
+rusk-ndk = { path = "crates/rusk-ndk" }
+rusk-ndk-sys = { path = "crates/rusk-ndk-sys" }
+rusk-sdkmgr = { path = "crates/rusk-sdkmgr" }
+rusk-androidgen = { path = "crates/rusk-androidgen" }
+rusk-jnigen = { path = "crates/rusk-jnigen" }
+rusk-javadeps = { path = "crates/rusk-javadeps" }
+rusk-apk = { path = "crates/rusk-apk" }
+rusk-ui = { path = "crates/rusk-ui" }
+rusk-build = { path = "crates/rusk-build" }
+rusk-keystore = { path = "crates/rusk-keystore" }
+rusk-proguard = { path = "crates/rusk-proguard" }
+rusk-bundle = { path = "crates/rusk-bundle" }
+rusk-lint = { path = "crates/rusk-lint" }
+rusk-symbolize = { path = "crates/rusk-symbolize" }
+rusk-profile = { path = "crates/rusk-profile" }
+rusk-workspace = { path = "crates/rusk-workspace" }
+rusk-cache = { path = "crates/rusk-cache" }
+rusk-render = { path = "crates/rusk-render" }
+rusk-diagnostics = { path = "crates/rusk-diagnostics" }
+rusk-jni-safe = { path = "crates/rusk-jni-safe" }
+rusk-embed-jvm = { path = "crates/rusk-embed-jvm" }
+rusk-tls = { path = "crates/rusk-tls" }
+rusk-sqlite = { path = "crates/rusk-sqlite" }
+rusk-incremental = { path = "crates/rusk-incremental" }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

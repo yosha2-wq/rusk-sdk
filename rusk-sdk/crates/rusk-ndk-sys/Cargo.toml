@@ -1,0 +1,10 @@
+[package]
+name = "rusk-ndk-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hand-written FFI bindings to the core Android NDK C APIs (native_activity, native_window, looper, input, asset_manager, log) for pure-Rust Android apps built with Rusk."
+
+[dependencies]
+
+[target.'cfg(target_os = "android")'.dependencies]

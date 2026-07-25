@@ -1,0 +1,465 @@
+//! rusk-cache: the two-file record-keeping system behind reproducible,
+//! fast-to-repeat Rusk builds.
+//!
+//! **`Rusk.lock`** lives next to a project's `Rusk.toml` and is meant to
+//! be committed to version control. It records exactly which component
+//! versions a successful build resolved to — NDK version, Android
+//! build-tools version, platform API level, and the fully-resolved
+//! (post-transitive-resolution) version of every Java/Maven dependency.
+//! Its job is the same as `Cargo.lock`'s: two people building the same
+//! `Rusk.toml` on different machines, or the same machine a year later
+//! after Google has published newer NDK/build-tools releases, get the
+//! same build, not silently different ones.
+//!
+//! **`Rusk.downloadcache`** is the opposite kind of file: local-only,
+//! never committed, and not something a human is meant to hand-edit. It
+//! is an append-only log of two kinds of event — every artifact Rusk
+//! downloaded (NDK archives, SDK components, Java jars, bundletool) and
+//! every compiler invocation Rusk ran (`cargo build` per ABI, `javac`,
+//! `d8`/`r8`), each with a timestamp, duration, inputs, and outcome. Its
+//! job is (a) letting Rusk skip work it can prove is already done
+//! correctly, and (b) giving a developer a complete, greppable history
+//! of "what did my last ten builds actually do" without needing
+//! `--verbose` output captured by hand.
+//!
+//! Both files live under `~/.rusk/cache/<project-fingerprint>/` — keyed
+//! by a hash of the project's canonical path, so two differently-named
+//! checkouts of the same project don't collide, and so the cache
+//! directory itself never has to be told the project's name up front.
+//! A compressed, non-encrypted snapshot of both files together
+//! (`rusk.lock.cache.xz`) is written on every update for easy backup or
+//! transfer to another machine — plain XZ, deliberately not encrypted,
+//! since the contents (version numbers and build timing) aren't
+//! sensitive and encryption would just get in the way of `xz -d`-ing it
+//! by hand when something needs to be inspected.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum CacheError {
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("failed to parse {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("failed to serialize cache data: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("could not determine a home directory to store the cache in")]
+    NoCacheDir,
+    #[error("xz compression failed: {0}")]
+    Xz(std::io::Error),
+}
+
+// ---------------------------------------------------------------------
+// Rusk.lock — committed, human-readable, reproducibility record
+// ---------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LockedJavaDep {
+    pub group: String,
+    pub artifact: String,
+    pub version: String,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuskLock {
+    /// Schema version, bumped whenever a field's meaning changes so an
+    /// old lockfile fails loudly instead of being silently misread.
+    pub lock_version: u32,
+    pub ndk_version: String,
+    pub build_tools_version: String,
+    pub platform_api: u32,
+    #[serde(default)]
+    pub java: Vec<LockedJavaDep>,
+    /// Unix timestamp (seconds) this lock was last written, purely
+    /// informational — shown by `rusk lock` so a developer can see at a
+    /// glance how stale their locked versions are.
+    #[serde(default)]
+    pub generated_at: u64,
+}
+
+const CURRENT_LOCK_VERSION: u32 = 1;
+
+impl RuskLock {
+    pub fn new(
+        ndk_version: impl Into<String>,
+        build_tools_version: impl Into<String>,
+        platform_api: u32,
+        java: Vec<LockedJavaDep>,
+    ) -> Self {
+        Self {
+            lock_version: CURRENT_LOCK_VERSION,
+            ndk_version: ndk_version.into(),
+            build_tools_version: build_tools_version.into(),
+            platform_api,
+            java,
+            generated_at: unix_now(),
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Option<Self>, CacheError> {
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let text = std::fs::read_to_string(path).map_err(|source| CacheError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let lock: RuskLock = toml::from_str(&text).map_err(|source| CacheError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(Some(lock))
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), CacheError> {
+        let text = toml::to_string_pretty(self)?;
+        let banner = "# Auto-generated by `rusk build`. Commit this file so every machine\n\
+                       # building this project resolves the exact same NDK, build-tools, and\n\
+                       # Java dependency versions. See Rusk.downloadcache (not committed) for\n\
+                       # the full local download/build history behind this resolution.\n\n";
+        write_atomically(path, format!("{banner}{text}").as_bytes())
+    }
+
+    /// True if a freshly resolved build matches what's already locked.
+    pub fn matches(&self, other: &RuskLock) -> bool {
+        self.ndk_version == other.ndk_version
+            && self.build_tools_version == other.build_tools_version
+            && self.platform_api == other.platform_api
+            && self.java.len() == other.java.len()
+            && self
+                .java
+                .iter()
+                .zip(other.java.iter())
+                .all(|(a, b)| a.group == b.group && a.artifact == b.artifact && a.version == b.version)
+    }
+}
+
+// ---------------------------------------------------------------------
+// Rusk.downloadcache — local-only, append-only download + build log
+// ---------------------------------------------------------------------
+
+/// One completed download, recorded exactly once per unique artifact —
+/// re-downloading the same version is a cache *hit* and does not append
+/// a new entry, only refreshes `last_verified_at`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadRecord {
+    /// Short machine-readable kind: "ndk", "sdk-build-tools",
+    /// "sdk-platform-tools", "sdk-platform", "java-dependency",
+    /// "bundletool", "emulator", "system-image".
+    pub kind: String,
+    /// Human-readable identifier, e.g. "NDK 27.0.12077973" or
+    /// "androidx.core:core-ktx:1.13.1".
+    pub label: String,
+    pub source_url: String,
+    pub local_path: PathBuf,
+    pub size_bytes: u64,
+    pub sha256: Option<String>,
+    pub downloaded_at: u64,
+    pub last_verified_at: u64,
+    /// Wall-clock download duration in milliseconds — kept so `rusk
+    /// cache stats` can report actual observed transfer speed over time,
+    /// not just the most recent download's.
+    pub duration_ms: u64,
+}
+
+/// One compiler/toolchain invocation, appended every time regardless of
+/// outcome — a failed build is exactly as worth logging as a successful
+/// one when the question later is "why did this break".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuildStepRecord {
+    /// "cargo-build", "javac", "d8", "r8", "aapt2-link", "zipalign",
+    /// "apksigner".
+    pub tool: String,
+    /// e.g. the ABI triple for a cargo-build step, or "release"/"debug"
+    /// for steps that aren't per-ABI.
+    pub context: String,
+    pub started_at: u64,
+    pub duration_ms: u64,
+    pub success: bool,
+    /// Truncated tail of stderr on failure, kept short deliberately —
+    /// this is a locate-the-failure index, not a replacement for the
+    /// full build log the terminal already showed.
+    pub error_tail: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct DownloadCache {
+    #[serde(default)]
+    pub downloads: Vec<DownloadRecord>,
+    #[serde(default)]
+    pub build_steps: Vec<BuildStepRecord>,
+}
+
+impl DownloadCache {
+    pub fn load(path: &Path) -> Result<Self, CacheError> {
+        if !path.is_file() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path).map_err(|source| CacheError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| CacheError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn write(&self, path: &Path) -> Result<(), CacheError> {
+        let banner = "# Local build/download history. NOT committed to version control (see\n\
+                       # .gitignore) — this is a per-machine log, not a reproducibility record.\n\
+                       # See Rusk.lock for the versions this history resolved to.\n\n";
+        let text = toml::to_string_pretty(self)?;
+        write_atomically(path, format!("{banner}{text}").as_bytes())
+    }
+
+    /// Records a download, or refreshes `last_verified_at` on the
+    /// existing record if this exact (kind, label, local_path) was
+    /// already logged — re-downloading an already-cached artifact
+    /// updates the log's freshness timestamp rather than duplicating it.
+    pub fn record_download(&mut self, mut record: DownloadRecord) {
+        if let Some(existing) = self
+            .downloads
+            .iter_mut()
+            .find(|d| d.kind == record.kind && d.label == record.label && d.local_path == record.local_path)
+        {
+            existing.last_verified_at = record.downloaded_at;
+            existing.size_bytes = record.size_bytes;
+            if record.sha256.is_some() {
+                existing.sha256 = record.sha256;
+            }
+        } else {
+            record.last_verified_at = record.downloaded_at;
+            self.downloads.push(record);
+        }
+    }
+
+    pub fn record_build_step(&mut self, record: BuildStepRecord) {
+        self.build_steps.push(record);
+        // Keep the log bounded — a build run daily for a year is ~365
+        // entries per tool; 2000 is generous headroom while still
+        // capping unbounded growth for a project built continuously in
+        // a long-running CI loop.
+        const MAX_BUILD_STEPS: usize = 2000;
+        if self.build_steps.len() > MAX_BUILD_STEPS {
+            let overflow = self.build_steps.len() - MAX_BUILD_STEPS;
+            self.build_steps.drain(0..overflow);
+        }
+    }
+
+    /// Total bytes across every distinct cached download — what `rusk
+    /// cache stats` shows as "total downloaded".
+    pub fn total_download_bytes(&self) -> u64 {
+        self.downloads.iter().map(|d| d.size_bytes).sum()
+    }
+
+    /// Success/failure counts per tool, most recent build steps first —
+    /// used for a quick "how reliable has `javac` been lately" summary.
+    pub fn build_step_summary(&self) -> Vec<(String, usize, usize)> {
+        let mut by_tool: std::collections::BTreeMap<String, (usize, usize)> = std::collections::BTreeMap::new();
+        for step in &self.build_steps {
+            let entry = by_tool.entry(step.tool.clone()).or_insert((0, 0));
+            if step.success {
+                entry.0 += 1;
+            } else {
+                entry.1 += 1;
+            }
+        }
+        by_tool.into_iter().map(|(tool, (ok, fail))| (tool, ok, fail)).collect()
+    }
+}
+
+// ---------------------------------------------------------------------
+// Cache directory layout + compressed snapshot
+// ---------------------------------------------------------------------
+
+/// Returns `~/.rusk/cache/<project-fingerprint>/`, creating it if
+/// needed. The fingerprint is a short hash of the project's canonical
+/// path, so `~/code/myapp` and a second clone at `~/other/myapp-copy`
+/// get independent cache entries rather than colliding or sharing state
+/// that doesn't actually apply to both.
+pub fn project_cache_dir(project_root: &Path) -> Result<PathBuf, CacheError> {
+    let home = dirs::home_dir().ok_or(CacheError::NoCacheDir)?;
+    let canonical = project_root.canonicalize().unwrap_or_else(|_| project_root.to_path_buf());
+    let fingerprint = short_hash(&canonical.to_string_lossy());
+    let dir = home.join(".rusk").join("cache").join(fingerprint);
+    std::fs::create_dir_all(&dir).map_err(|source| CacheError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    Ok(dir)
+}
+
+pub fn download_cache_path(project_cache_dir: &Path) -> PathBuf {
+    project_cache_dir.join("Rusk.downloadcache")
+}
+
+/// The committed lock file lives at the project root (`Rusk.toml`'s
+/// directory) so it travels with the repository; this is that path.
+pub fn project_lock_path(project_root: &Path) -> PathBuf {
+    project_root.join("Rusk.lock")
+}
+
+/// The mirrored copy of `Rusk.lock` kept inside the local cache
+/// directory — not authoritative (the project-root copy is what's
+/// committed and what `rusk build` reads), but kept in sync on every
+/// write so `~/.rusk/cache/<fingerprint>/` is a complete, self-contained
+/// snapshot of "everything about this project's last build" in one
+/// place, which is what the compressed `.xz` snapshot bundles together.
+pub fn cached_lock_mirror_path(project_cache_dir: &Path) -> PathBuf {
+    project_cache_dir.join("Rusk.lock")
+}
+
+/// Writes `lock` to the project root (the committed copy) and mirrors it
+/// into the local cache directory, then refreshes the compressed
+/// snapshot — the one call site `rusk-build` needs after a successful
+/// build, instead of three separate write calls scattered through the
+/// build pipeline.
+pub fn sync_lock(
+    project_root: &Path,
+    project_cache_dir: &Path,
+    lock: &RuskLock,
+    download_cache: &DownloadCache,
+) -> Result<(), CacheError> {
+    lock.write(&project_lock_path(project_root))?;
+    lock.write(&cached_lock_mirror_path(project_cache_dir))?;
+    write_compressed_snapshot(project_cache_dir, Some(lock), download_cache)?;
+    Ok(())
+}
+
+/// A small, dependency-free FNV-1a hash rendered as 12 hex chars —
+/// plenty of collision resistance for "distinguish a handful of project
+/// checkouts on one machine's cache directory", without pulling in a
+/// full hashing crate for something this local and low-stakes.
+fn short_hash(s: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in s.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:012x}")
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Writes `contents` to `path` via a temp-file-then-rename, so a process
+/// interrupted mid-write (Ctrl+C during a build) never leaves a
+/// truncated, unparseable `Rusk.lock`/`Rusk.downloadcache` behind for
+/// the next run to trip over.
+fn write_atomically(path: &Path, contents: &[u8]) -> Result<(), CacheError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| CacheError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let tmp_path = path.with_extension("tmp-write");
+    std::fs::write(&tmp_path, contents).map_err(|source| CacheError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    std::fs::rename(&tmp_path, path).map_err(|source| CacheError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    Ok(())
+}
+
+/// Writes a single XZ-compressed snapshot (`rusk.lock.cache.xz`)
+/// containing both `Rusk.lock` and `Rusk.downloadcache` concatenated
+/// with a plain-text separator header — deliberately compression only,
+/// not encryption, so the archive can be inspected with any standard
+/// `xz`/`unxz` tool without needing a passphrase or key. This is meant
+/// for backing up or transferring a machine's build history/cache
+/// state, not for protecting anything sensitive (none of this data is).
+pub fn write_compressed_snapshot(
+    project_cache_dir: &Path,
+    lock: Option<&RuskLock>,
+    download_cache: &DownloadCache,
+) -> Result<PathBuf, CacheError> {
+    let mut combined = String::new();
+    combined.push_str("# rusk.lock.cache.xz — combined snapshot, xz-compressed, NOT encrypted.\n");
+    combined.push_str("# Decompress with: xz -d rusk.lock.cache.xz -c | less\n");
+    combined.push_str(&format!("# snapshot_taken_at = {}\n\n", unix_now()));
+
+    combined.push_str("# ===== Rusk.lock =====\n");
+    if let Some(lock) = lock {
+        combined.push_str(&toml::to_string_pretty(lock)?);
+    } else {
+        combined.push_str("# (no Rusk.lock present at snapshot time)\n");
+    }
+
+    combined.push_str("\n# ===== Rusk.downloadcache =====\n");
+    combined.push_str(&toml::to_string_pretty(download_cache)?);
+
+    let out_path = project_cache_dir.join("rusk.lock.cache.xz");
+    let tmp_path = out_path.with_extension("xz.tmp-write");
+
+    let file = std::fs::File::create(&tmp_path).map_err(|source| CacheError::Io {
+        path: tmp_path.clone(),
+        source,
+    })?;
+    // Preset 6 is xz's own default: a solid balance of ratio vs speed
+    // for a file that's at most a few hundred KB of TOML text, where
+    // shaving another second off compression time isn't worth trading
+    // away ratio for.
+    let mut encoder = xz2::write::XzEncoder::new(file, 6);
+    encoder.write_all(combined.as_bytes()).map_err(CacheError::Xz)?;
+    encoder.finish().map_err(CacheError::Xz)?;
+
+    std::fs::rename(&tmp_path, &out_path).map_err(|source| CacheError::Io {
+        path: out_path.clone(),
+        source,
+    })?;
+    Ok(out_path)
+}
+
+/// Decompresses a `rusk.lock.cache.xz` snapshot back to plain text, for
+/// `rusk cache inspect <file>` or manual recovery after copying it to a
+/// new machine.
+pub fn read_compressed_snapshot(xz_path: &Path) -> Result<String, CacheError> {
+    let file = std::fs::File::open(xz_path).map_err(|source| CacheError::Io {
+        path: xz_path.to_path_buf(),
+        source,
+    })?;
+    let mut decoder = xz2::read::XzDecoder::new(file);
+    let mut out = String::new();
+    std::io::Read::read_to_string(&mut decoder, &mut out).map_err(|source| CacheError::Io {
+        path: xz_path.to_path_buf(),
+        source,
+    })?;
+    Ok(out)
+}
+
+/// Human-readable summary line for `rusk cache stats`, kept here rather
+/// than in the CLI so the same summary logic can be reused by anything
+/// else that wants a one-line cache health check (e.g. `rusk doctor`).
+pub fn format_stats(cache: &DownloadCache) -> String {
+    let total_bytes = cache.total_download_bytes();
+    let mb = total_bytes as f64 / (1024.0 * 1024.0);
+    let step_summary = cache.build_step_summary();
+    let total_steps: usize = step_summary.iter().map(|(_, ok, fail)| ok + fail).sum();
+    format!(
+        "{} cached downloads ({:.1} MB total), {} logged build steps across {} tools",
+        cache.downloads.len(),
+        mb,
+        total_steps,
+        step_summary.len()
+    )
+}

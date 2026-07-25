@@ -1,0 +1,27 @@
+[package]
+name = "rusk-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rusk"
+path = "src/main.rs"
+
+[dependencies]
+rusk-manifest = { workspace = true }
+rusk-androidgen = { workspace = true }
+rusk-build = { workspace = true }
+rusk-sdkmgr = { workspace = true }
+rusk-ndk = { workspace = true }
+rusk-cache = { workspace = true }
+rusk-keystore = { workspace = true }
+rusk-lint = { workspace = true }
+rusk-bundle = { workspace = true }
+rusk-symbolize = { workspace = true }
+rusk-ui = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+which = { workspace = true }
+dirs = { workspace = true }
+toml = { workspace = true }

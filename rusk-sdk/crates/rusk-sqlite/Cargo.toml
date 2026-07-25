@@ -1,0 +1,9 @@
+[package]
+name = "rusk-sqlite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
+thiserror = { workspace = true }

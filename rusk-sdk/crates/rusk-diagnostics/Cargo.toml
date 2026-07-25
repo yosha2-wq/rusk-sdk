@@ -1,0 +1,12 @@
+[package]
+name = "rusk-diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rusk-ndk-sys = { workspace = true }
+backtrace = "0.3"
+log = "0.4"
+log-panics = { version = "2", features = ["with-backtrace"] }
+android_logger = "0.14"
