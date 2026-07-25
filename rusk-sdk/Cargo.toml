@@ -35,7 +35,7 @@ edition = "2021"
 license = "MIT"
 license-file = "LICENSE"
 authors = ["Rusk SDK Contributors"]
-repository = "https://github.com/rusk-sdk/rusk"
+repository = "https://github.com/yosha2-wq/rusk-sdk/tree/source"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
