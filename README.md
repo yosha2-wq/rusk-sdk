@@ -413,7 +413,7 @@ stealers, or anything that tampers with another party's security
 without authorization — that's a statement of intent, not an additional
 legal condition on top of the permissive grant.
 
-## Honesty about scope (0.2.4)
+## Honesty about scope (0.9.7)
 
 This is a genuinely working, from-scratch toolchain, not a wrapper around
 Gradle or `cargo-apk` — but it is still early, not a mature SDK:
